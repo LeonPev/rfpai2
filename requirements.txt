@@ -1,0 +1,9 @@
+Flask
+flask-cors
+python-dotenv
+python-docx
+docx2txt
+markitdown[docx]
+google-genai
+md2docx-python
+markdown-pdf
