@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+import io
 import os
 import tempfile
 from dotenv import load_dotenv
@@ -10,6 +11,7 @@ from market_research import run_market_research
 from table_of_contents import generate_new_table_of_contents
 from workflow_jobs import advance_workflow, create_workflow, load_workflow
 from workflow_store import get_workflow_store
+from file_store import get_file_store
 
 load_dotenv()
 
@@ -17,12 +19,13 @@ app = Flask(__name__, static_folder='static', static_url_path='')
 # Enable CORS for the React frontend
 CORS(app)
 
-# Local storage paths
+# Legacy local storage paths (kept for backward compatibility if needed)
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 CREATED_FOLDER = os.path.join(os.path.dirname(__file__), 'created_files')
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CREATED_FOLDER, exist_ok=True)
+# File storage namespace constants
+UPLOADS_NAMESPACE = 'uploads'
+CREATED_FILES_NAMESPACE = 'created_files'
 
 
 def load_original_toc_page_text():
@@ -68,22 +71,32 @@ def upload_file():
     if file.filename == '':
         return jsonify({"error": "Empty filename"}), 400
     
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    file.save(file_path)
-    return jsonify({"message": f"File {file.filename} uploaded successfully"}), 200
+    try:
+        store = get_file_store()
+        content = file.read()
+        store.write_bytes(UPLOADS_NAMESPACE, file.filename, content)
+        return jsonify({"message": f"File {file.filename} uploaded successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to upload file: {str(e)}"}), 500
 
 @app.route('/api/uploads', methods=['GET'])
 def list_uploaded_files():
-    files = os.listdir(UPLOAD_FOLDER)
-    return jsonify({"files": files})
+    try:
+        store = get_file_store()
+        files = store.list_files(UPLOADS_NAMESPACE)
+        return jsonify({"files": files})
+    except Exception as e:
+        return jsonify({"error": f"Failed to list files: {str(e)}"}), 500
 
 @app.route('/api/uploads/<filename>', methods=['DELETE'])
 def delete_uploaded_file(filename):
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        return jsonify({"message": "File deleted"}), 200
-    return jsonify({"error": "File not found"}), 404
+    try:
+        store = get_file_store()
+        if store.delete(UPLOADS_NAMESPACE, filename):
+            return jsonify({"message": "File deleted"}), 200
+        return jsonify({"error": "File not found"}), 404
+    except Exception as e:
+        return jsonify({"error": f"Failed to delete file: {str(e)}"}), 500
 
 @app.route('/api/convert', methods=['POST'])
 def convert_doc():
@@ -96,38 +109,42 @@ def convert_doc():
         
     if not new_filename.endswith('.md'):
         new_filename += '.md'
-        
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return jsonify({"error": "Original file not found"}), 404
-        
+    
     try:
-        if filename.endswith('.docx') or filename.endswith('.doc'):
-            md = MarkItDown(enable_plugins=False)
-            text = md.convert(file_path)
-            md_content = f"# {new_filename.replace('.md', '')}\n\n{text}"
-        else:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                md_content = f.read()
+        store = get_file_store()
+        if not store.exists(UPLOADS_NAMESPACE, filename):
+            return jsonify({"error": "Original file not found"}), 404
+        
+        # Materialize the file temporarily to process it
+        with store.materialize_file(UPLOADS_NAMESPACE, filename) as file_path:
+            try:
+                if filename.endswith('.docx') or filename.endswith('.doc'):
+                    md = MarkItDown(enable_plugins=False)
+                    text = md.convert(file_path)
+                    md_content = f"# {new_filename.replace('.md', '')}\n\n{text}"
+                else:
+                    md_content = store.read_text(UPLOADS_NAMESPACE, filename)
+            except Exception as e:
+                return jsonify({"error": f"Failed to process file: {str(e)}"}), 500
+        
+        # Save the converted file to created_files
+        store.write_text(CREATED_FILES_NAMESPACE, new_filename, md_content)
+        
+        return jsonify({
+            "message": "Converted successfully", 
+            "content": md_content,
+            "new_filename": new_filename
+        }), 200
     except Exception as e:
-        return jsonify({"error": f"Failed to process docx: {str(e)}"}), 500
-        
-    # Save the markdown directly to drafts / created_files
-    dest_path = os.path.join(CREATED_FOLDER, new_filename)
-    with open(dest_path, 'w', encoding='utf-8') as f:
-        f.write(md_content)
-        
-    return jsonify({
-        "message": "Converted successfully", 
-        "content": md_content,
-        "new_filename": new_filename
-    }), 200
+        return jsonify({"error": f"Conversion failed: {str(e)}"}), 500
 
 @app.route('/api/uploads/<filename>', methods=['GET'])
 def get_uploaded_file(filename):
     try:
-        with open(os.path.join(UPLOAD_FOLDER, filename), 'r', encoding='utf-8') as f:
-            content = f.read()
+        store = get_file_store()
+        if not store.exists(UPLOADS_NAMESPACE, filename):
+            return jsonify({"error": "File not found"}), 404
+        content = store.read_text(UPLOADS_NAMESPACE, filename)
         return jsonify({"content": content})
     except Exception as e:
         return jsonify({"error": str(e)}), 404
@@ -152,73 +169,117 @@ def save_created_file():
     elif output_format == 'docx' and not filename.endswith('.docx'):
         filename += '.docx'
 
-    file_path = os.path.join(CREATED_FOLDER, filename)
-
     try:
+        store = get_file_store()
+        
         if output_format == 'pdf':
-            pdf = MarkdownPdf(toc_level=2, optimize=True)
-            pdf.meta['title'] = os.path.splitext(filename)[0]
-            pdf.add_section(Section(content, root=os.path.dirname(__file__)))
-            pdf.save(file_path)
+            # Generate PDF to temporary file, then save to storage
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_pdf:
+                temp_pdf_path = temp_pdf.name
+            try:
+                pdf = MarkdownPdf(toc_level=2, optimize=True)
+                pdf.meta['title'] = os.path.splitext(filename)[0]
+                pdf.add_section(Section(content, root=os.path.dirname(__file__)))
+                pdf.save(temp_pdf_path)
+                with open(temp_pdf_path, 'rb') as f:
+                    store.write_bytes(CREATED_FILES_NAMESPACE, filename, f.read(), content_type='application/pdf')
+            finally:
+                if os.path.exists(temp_pdf_path):
+                    os.remove(temp_pdf_path)
+                    
         elif output_format == 'docx':
+            # Generate DOCX via temp markdown file
             with tempfile.NamedTemporaryFile('w', suffix='.md', encoding='utf-8', delete=False) as temp_md:
                 temp_md.write(content)
                 temp_md_path = temp_md.name
+            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as temp_docx:
+                temp_docx_path = temp_docx.name
             try:
-                markdown_to_word(temp_md_path, file_path)
+                markdown_to_word(temp_md_path, temp_docx_path)
+                with open(temp_docx_path, 'rb') as f:
+                    store.write_bytes(CREATED_FILES_NAMESPACE, filename, f.read(), 
+                                    content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
             finally:
                 if os.path.exists(temp_md_path):
                     os.remove(temp_md_path)
-        else:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+                if os.path.exists(temp_docx_path):
+                    os.remove(temp_docx_path)
+        else:  # markdown
+            store.write_text(CREATED_FILES_NAMESPACE, filename, content, content_type='text/markdown; charset=utf-8')
+            
+        return jsonify({"message": "File saved successfully", "filename": filename}), 200
     except Exception as e:
         return jsonify({"error": f"Failed to save file: {str(e)}"}), 500
 
-    return jsonify({"message": "File saved successfully", "filename": filename}), 200
-
 @app.route('/api/files', methods=['GET'])
 def list_created_files():
-    files = os.listdir(CREATED_FOLDER)
-    return jsonify({"files": files})
+    try:
+        store = get_file_store()
+        files = store.list_files(CREATED_FILES_NAMESPACE)
+        return jsonify({"files": files})
+    except Exception as e:
+        return jsonify({"error": f"Failed to list files: {str(e)}"}), 500
 
 @app.route('/api/files/<filename>', methods=['GET'])
 def download_created_file(filename):
-    return send_from_directory(CREATED_FOLDER, filename, as_attachment=True)
+    try:
+        store = get_file_store()
+        if not store.exists(CREATED_FILES_NAMESPACE, filename):
+            return jsonify({"error": "File not found"}), 404
+        
+        # For binary files (pdf, docx), we need to stream them
+        if filename.endswith('.pdf'):
+            content = store.read_bytes(CREATED_FILES_NAMESPACE, filename)
+            return send_file(io.BytesIO(content), mimetype='application/pdf', as_attachment=True, download_name=filename)
+        elif filename.endswith('.docx'):
+            content = store.read_bytes(CREATED_FILES_NAMESPACE, filename)
+            return send_file(io.BytesIO(content), 
+                            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                            as_attachment=True, download_name=filename)
+        else:  # markdown
+            content = store.read_text(CREATED_FILES_NAMESPACE, filename)
+            return send_file(io.BytesIO(content.encode('utf-8')), mimetype='text/markdown', 
+                            as_attachment=True, download_name=filename)
+    except Exception as e:
+        return jsonify({"error": f"Failed to download file: {str(e)}"}), 500
 
 @app.route('/api/improve', methods=['POST'])
 def improve_document():
     data = request.json
     filename = data.get('filename')
-    if filename:
-        if filename.endswith('.md'):
-            base_name = filename[:-3]
-            if base_name.startswith('new-'):
-                base_name = base_name[4:]
-            
-            file_path = os.path.join(UPLOAD_FOLDER, base_name + '.docx')
-            if not os.path.exists(file_path):
-                file_path = os.path.join(UPLOAD_FOLDER, base_name + '.doc')
-                
-            if not os.path.exists(file_path):
-                file_path = os.path.join(UPLOAD_FOLDER, filename)
-        else:
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            
-        if not os.path.exists(file_path):
-            return jsonify({"error": "File not found in uploads folder"}), 404
-    else:
-        return jsonify({"error": "Missing filename parameter. Process_document requires a valid .docx file from uploads."}), 400
-
+    
     try:
-        workflow = create_workflow(
-            get_workflow_store(),
-            'improve',
-            {
-                'filename': filename,
-                'source_local_path': file_path,
-            },
-        )
+        store = get_file_store()
+        
+        if filename:
+            # Try to find the file in uploads
+            actual_filename = filename
+            if filename.endswith('.md'):
+                base_name = filename[:-3]
+                if base_name.startswith('new-'):
+                    base_name = base_name[4:]
+                
+                # Try .docx, then .doc, then original filename
+                for variant in [f"{base_name}.docx", f"{base_name}.doc", filename]:
+                    if store.exists(UPLOADS_NAMESPACE, variant):
+                        actual_filename = variant
+                        break
+            
+            if not store.exists(UPLOADS_NAMESPACE, actual_filename):
+                return jsonify({"error": "File not found in uploads folder"}), 404
+        else:
+            return jsonify({"error": "Missing filename parameter. Process_document requires a valid .docx file from uploads."}), 400
+
+        # Materialize the file to get a local path for the workflow
+        with store.materialize_file(UPLOADS_NAMESPACE, actual_filename) as file_path:
+            workflow = create_workflow(
+                get_workflow_store(),
+                'improve',
+                {
+                    'filename': filename or actual_filename,
+                    'source_local_path': file_path,
+                },
+            )
         return jsonify(workflow), 202
     except Exception as e:
         return jsonify({"error": str(e)}), 500
