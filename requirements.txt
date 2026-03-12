@@ -7,3 +7,6 @@ markitdown[docx]
 google-genai
 md2docx-python
 markdown-pdf
+langchain-text-splitters
+google-cloud-storage
+gunicorn

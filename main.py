@@ -1,16 +1,15 @@
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
-import json
-import time
 import tempfile
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from markitdown import MarkItDown
 from markdown_pdf import MarkdownPdf, Section
 from md2docx_python.src.md2docx_python import markdown_to_word
-from doc_workflow import process_document_stream
+from market_research import run_market_research
+from table_of_contents import generate_new_table_of_contents
+from workflow_jobs import advance_workflow, create_workflow, load_workflow
+from workflow_store import get_workflow_store
 
 load_dotenv()
 
@@ -24,6 +23,34 @@ CREATED_FOLDER = os.path.join(os.path.dirname(__file__), 'created_files')
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(CREATED_FOLDER, exist_ok=True)
+
+
+def load_original_toc_page_text():
+    toc_doc_path = os.path.join(os.path.dirname(__file__), 'toc_and_all_sections.md')
+    if not os.path.exists(toc_doc_path):
+        return ""
+
+    try:
+        with open(toc_doc_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        marker = "# Section 1"
+        idx = content.find(marker)
+        if idx == -1:
+            first_page = content.strip()
+        else:
+            first_page = content[:idx].strip()
+
+        # Keep the exact TOC page body while removing artificial section markers.
+        lines = first_page.splitlines()
+        if lines and lines[0].strip().lower() == "# section 0":
+            lines = lines[1:]
+            while lines and not lines[0].strip():
+                lines = lines[1:]
+
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
 
 @app.route('/')
 def serve_index():
@@ -163,10 +190,7 @@ def download_created_file(filename):
 def improve_document():
     data = request.json
     filename = data.get('filename')
-    print(f"Received request to improve document: {filename}")
     if filename:
-        # Check in uploads folder for the original document
-        # If frontend sends .md, try to find the corresponding .docx
         if filename.endswith('.md'):
             base_name = filename[:-3]
             if base_name.startswith('new-'):
@@ -187,23 +211,38 @@ def improve_document():
         return jsonify({"error": "Missing filename parameter. Process_document requires a valid .docx file from uploads."}), 400
 
     try:
-        def generate():
-            try:
-                for update in process_document_stream(file_path):
-                    if update.get("step") == "completed":
-                        result = update.get("result") or {}
+        workflow = create_workflow(
+            get_workflow_store(),
+            'improve',
+            {
+                'filename': filename,
+                'source_local_path': file_path,
+            },
+        )
+        return jsonify(workflow), 202
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-                        # Transform the payload for backward compatible handling in frontend
-                        if "table" in result and "items" not in result:
-                            result["items"] = result["table"]
 
-                        yield json.dumps({"step": "completed", "result": result}, ensure_ascii=False) + "\n"
-                    else:
-                        yield json.dumps({"step": update.get("step", "Processing...")}, ensure_ascii=False) + "\n"
-            except Exception as e:
-                yield json.dumps({"error": str(e)}, ensure_ascii=False) + "\n"
-                
-        return Response(generate(), mimetype='application/x-ndjson')
+@app.route('/api/workflows/<workflow_id>', methods=['GET'])
+def get_workflow_status(workflow_id):
+    try:
+        workflow = load_workflow(get_workflow_store(), workflow_id)
+        return jsonify(workflow), 200
+    except FileNotFoundError:
+        return jsonify({"error": "Workflow not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/workflows/<workflow_id>/advance', methods=['POST'])
+def advance_workflow_endpoint(workflow_id):
+    try:
+        workflow = advance_workflow(get_workflow_store(), workflow_id)
+        status_code = 200 if workflow.get('status') != 'failed' else 500
+        return jsonify(workflow), status_code
+    except FileNotFoundError:
+        return jsonify({"error": "Workflow not found"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -222,6 +261,113 @@ def section_chat_endpoint():
     from section_chat import chat_with_section
     result = chat_with_section(user_message, selected_row, chat_history)
     return jsonify(result)
+
+@app.route('/api/market-research', methods=['POST'])
+def market_research_endpoint():
+    data = request.json or {}
+    summary = (data.get('summary') or '').strip()
+    user_goal = (data.get('user_goal') or '').strip()
+
+    if not summary:
+        return jsonify({"error": "Missing summary"}), 400
+    if not user_goal:
+        return jsonify({"error": "Missing user_goal"}), 400
+
+    try:
+        workflow = create_workflow(
+            get_workflow_store(),
+            'market_research',
+            {
+                'summary': summary,
+                'user_goal': user_goal,
+            },
+        )
+        return jsonify(workflow), 202
+    except Exception as e:
+        return jsonify({"error": f"Failed to run market research: {str(e)}"}), 500
+
+
+@app.route('/api/table-of-contents', methods=['POST'])
+def table_of_contents_endpoint():
+    data = request.json or {}
+    summary = (data.get('summary') or '').strip()
+    market_research = (data.get('market_research') or '').strip()
+    original_toc_text = (data.get('original_toc_text') or '').strip()
+    original_toc = data.get('original_toc') or []
+
+    if not summary:
+        return jsonify({"error": "Missing summary"}), 400
+    if not market_research:
+        return jsonify({"error": "Missing market_research"}), 400
+
+    try:
+        original_toc_page_text = original_toc_text or load_original_toc_page_text()
+        result = generate_new_table_of_contents(
+            document_summary=summary,
+            market_research=market_research,
+            toc_path=os.path.join(os.path.dirname(__file__), 'toc.json'),
+            original_toc_page_text=original_toc_page_text,
+            original_toc=original_toc,
+        )
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate table of contents: {str(e)}"}), 500
+
+
+@app.route('/api/section-generation', methods=['POST'])
+def create_section_generation_workflow():
+    data = request.json or {}
+    sections = data.get('sections') or []
+    market_research = (data.get('market_research') or '').strip()
+    document_summary = (data.get('document_summary') or '').strip()
+
+    if not sections or not isinstance(sections, list):
+        return jsonify({"error": "Missing or invalid sections"}), 400
+    if not market_research:
+        return jsonify({"error": "Missing market_research"}), 400
+
+    try:
+        workflow = create_workflow(
+            get_workflow_store(),
+            'section_generation',
+            {
+                'sections': sections,
+                'market_research': market_research,
+                'document_summary': document_summary,
+            },
+        )
+        return jsonify(workflow), 202
+    except Exception as e:
+        return jsonify({"error": f"Failed to create section workflow: {str(e)}"}), 500
+
+
+@app.route('/api/create-section', methods=['POST'])
+def create_single_section_workflow():
+    data = request.json or {}
+    chapter_title = (data.get('chapter_title') or '').strip()
+    original_text = (data.get('original_text') or '').strip()
+    market_research = (data.get('market_research') or '').strip()
+    document_summary = (data.get('document_summary') or '').strip()
+
+    if not chapter_title:
+        return jsonify({"error": "Missing chapter_title"}), 400
+    if not market_research:
+        return jsonify({"error": "Missing market_research"}), 400
+
+    try:
+        workflow = create_workflow(
+            get_workflow_store(),
+            'single_section',
+            {
+                'chapter_title': chapter_title,
+                'original_text': original_text,
+                'market_research': market_research,
+                'document_summary': document_summary,
+            },
+        )
+        return jsonify(workflow), 202
+    except Exception as e:
+        return jsonify({"error": f"Failed to create section workflow: {str(e)}"}), 500
 
 
 if __name__ == '__main__':

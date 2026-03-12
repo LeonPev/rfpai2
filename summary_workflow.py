@@ -1,5 +1,3 @@
-import os
-import re
 import json
 
 from dotenv import load_dotenv
@@ -72,34 +70,56 @@ Return valid JSON only in this format:
     return extract_json(text)
 
 
-def improve_section(section):
+def summarize_section(section):
     prompt = f"""
-You are improving one section of a document.
+אתה יוצר סיכום תמציתי של סעיף אחד במסמך.
 
-Section title:
+כותרת הסעיף:
 {section["section_title"]}
 
-Section text:
+טקסט הסעיף:
 {section["text"]}
 
-Task:
-Improve this section so it is clearer, more concise, and more modern,
-while keeping the original meaning and intent.
+משימה:
+יצור סיכום קצר וברור של סעיף זה שלוכד את הנקודות העיקריות והמושגים הראשיים.
+הסיכום צריך להיות תמציתי, מקצועי ומתאים לסקירה ניהולית.
 
-Return valid JSON only in this format:
+החזר JSON בלבד בפורמט הזה:
 {{
-  "improved_text": "rewritten section text",
-  "explanation": "what was improved"
+  "summary": "סיכום תמציתי של הסעיף"
 }}
 """
     text = ask_gemini(prompt)
     return extract_json(text)
 
 
+def process_document_once(doc_path):
+    sections = split_doc_to_sections(doc_path)
+    table = []
+
+    for section in sections:
+        result = summarize_section(section)
+        table.append(
+            {
+                "section_title": section.get("section_title", ""),
+                "original_text": section.get("text", ""),
+                "summary": result.get("summary", ""),
+            }
+        )
+
+    return {
+        "source_file": doc_path,
+        "table": table,
+    }
+
+
 def process_document_stream(doc_path):
     yield {"step": "שלב 1: פיצול המסמך לסעיפים..."}
+    # with open("document_summary_res.json", "r") as f:    
+    #     res = json.loads(f.read())
+    # yield res
+    # return    
     sections = split_doc_to_sections(doc_path)
-
     total = len(sections)
     yield {"step": f"נמצאו {total} סעיפים במסמך"}
 
@@ -119,13 +139,12 @@ def process_document_stream(doc_path):
         # print(section_text)
         print("=" * 80)
 
-        result = improve_section(section)
+        result = summarize_section(section)
 
         row = {
             "section_title": section_title,
             "original_text": section_text,
-            "improved_text": result.get("improved_text", ""),
-            "explanation": result.get("explanation", "")
+            "summary": result.get("summary", "")
         }
         table.append(row)
 
@@ -135,38 +154,14 @@ def process_document_stream(doc_path):
         "source_file": doc_path,
         "table": table
     }
-
-    yield {"step": "completed", "result": final_result}
+    fin_step = {"step": "completed", "result": final_result}
+    with open("document_summary_res.json", "w") as f:
+        f.write(json.dumps(fin_step, ensure_ascii=False, indent=2)) 
+    yield fin_step
 
 
 def process_document(doc_path):
-    # return mock for testing
-    # return {
-    #     "source_file": doc_path,
-    #     "table": [
-    #         {
-    #             "section_title": "הקדמה",
-    #             "original_text": "טקסט מקורי של ההקדמה",
-    #             "improved_text": "טקסט משופר של ההקדמה",
-    #             "explanation": "שיפרתי את הניסוח והבהירות"
-    #         },
-    #         {
-    #             "section_title": "סקירת ספרות",
-    #             "original_text": "טקסט מקורי של סקירת הספרות",
-    #             "improved_text": "טקסט משופר של סקירת הספרות",
-    #             "explanation": "הוספתי מידע עדכני וארגנתי טוב יותר"
-    #         }
-    #     ]
-    # }
-    final_result = None
-    for update in process_document_stream(doc_path):
-        if update.get("step") == "completed":
-            final_result = update.get("result")
-
-    return final_result or {
-        "source_file": doc_path,
-        "table": []
-    }
+    return process_document_once(doc_path)
 
 
 def main():

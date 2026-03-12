@@ -8,7 +8,7 @@ from google.genai import types
 load_dotenv()
 
 _client = genai.Client()
-_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
+_MODEL = "gemini-3-flash-preview"
 
 _SYSTEM_TEMPLATE = """You are an expert document editor assistant for RFP (Request for Proposal) documents.
 You are helping a user refine a specific section. You may ONLY suggest changes to the "Improved Text" field.
